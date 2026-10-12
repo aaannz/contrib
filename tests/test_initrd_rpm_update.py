@@ -1130,6 +1130,7 @@ def test_run_update_skip_pillar_bypasses_pillar_calls(monkeypatch, tmp_path):
     monkeypatch.setattr(initrd_rpm_update, "validate_organization", lambda *_args: None)
     monkeypatch.setattr(initrd_rpm_update, "get_image_context", lambda *_args: context)
     monkeypatch.setattr(initrd_rpm_update, "extract_rpms", lambda *_args: None)
+    monkeypatch.setattr(initrd_rpm_update, "is_dracut_saltboot_rpm", lambda _rpm: False)
     monkeypatch.setattr(initrd_rpm_update, "build_overlay_member", lambda *_args: None)
     monkeypatch.setattr(
         initrd_rpm_update, "validate_overlay_member", lambda *_args: None
@@ -1251,3 +1252,102 @@ def test_overlay_member_integration_with_host_tools(tmp_path):
 
     assert member.exists()
     assert member.stat().st_size > 0
+
+
+# ==========================================
+# dracut-saltboot remapping
+# ==========================================
+SALTBOOT_MODULE_SETUP = Path("dracut-saltboot/saltboot/module-setup.sh")
+
+
+def test_parse_saltboot_module_setup_real_file():
+    hooks, cmdline = initrd_rpm_update.parse_saltboot_module_setup(SALTBOOT_MODULE_SETUP)
+    assert hooks == [
+        ("saltboot-root.sh", "lib/dracut/hooks/cmdline/91-saltboot-root.sh"),
+        ("saltboot.sh", "lib/dracut/hooks/pre-mount/99-saltboot.sh"),
+        (
+            "saltboot-timeout.sh",
+            "lib/dracut/hooks/initqueue/timeout/99-saltboot-timeout.sh",
+        ),
+    ]
+    assert cmdline == [("etc/cmdline.d/50saltboot.conf", "rd.neednet=1 rd.auto\n")]
+
+
+def test_parse_saltboot_module_setup_rejects_unknown_forms(tmp_path):
+    setup = tmp_path / "module-setup.sh"
+    setup.write_text('install() {\n    inst_hook cmdline 91 "$(dirname $0)/x.sh"\n}\n')
+    with pytest.raises(InitrdUpdateError, match="Unsupported inst_hook"):
+        initrd_rpm_update.parse_saltboot_module_setup(setup)
+
+    setup.write_text('echo "$ARGS" > "${initdir}/etc/cmdline.d/50saltboot.conf"\n')
+    with pytest.raises(InitrdUpdateError, match="Unsupported cmdline.d"):
+        initrd_rpm_update.parse_saltboot_module_setup(setup)
+
+    setup.write_text("install() {\n    true\n}\n")
+    with pytest.raises(InitrdUpdateError, match="No inst_hook"):
+        initrd_rpm_update.parse_saltboot_module_setup(setup)
+
+
+def test_extract_dracut_saltboot_rpm_remaps_paths(monkeypatch, tmp_path):
+    def fake_extract(rpm, dest):
+        moddir = dest / "usr/lib/dracut/modules.d/50saltboot"
+        moddir.mkdir(parents=True)
+        for src in SALTBOOT_MODULE_SETUP.parent.iterdir():
+            shutil.copy2(src, moddir / src.name)
+        unit_dir = dest / "usr/lib/systemd/system"
+        unit_dir.mkdir(parents=True)
+        (unit_dir / "image-deployed.service").write_text("[Unit]\n")
+
+    monkeypatch.setattr(initrd_rpm_update, "_extract_rpm", fake_extract)
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+
+    initrd_rpm_update.extract_dracut_saltboot_rpm(
+        tmp_path / "dracut-saltboot.rpm", overlay, tmp_path / "stage"
+    )
+
+    files = sorted(
+        p.relative_to(overlay).as_posix() for p in overlay.rglob("*") if p.is_file()
+    )
+    assert files == [
+        "etc/cmdline.d/50saltboot.conf",
+        "lib/dracut/hooks/cmdline/91-saltboot-root.sh",
+        "lib/dracut/hooks/initqueue/timeout/99-saltboot-timeout.sh",
+        "lib/dracut/hooks/pre-mount/99-saltboot.sh",
+    ]
+    hook = overlay / "lib/dracut/hooks/pre-mount/99-saltboot.sh"
+    assert hook.read_bytes() == (SALTBOOT_MODULE_SETUP.parent / "saltboot.sh").read_bytes()
+    assert os.access(hook, os.X_OK)
+    assert (overlay / "etc/cmdline.d/50saltboot.conf").read_text() == "rd.neednet=1 rd.auto\n"
+
+
+def test_extract_dracut_saltboot_rpm_missing_hook(monkeypatch, tmp_path):
+    def fake_extract(rpm, dest):
+        moddir = dest / "usr/lib/dracut/modules.d/50saltboot"
+        moddir.mkdir(parents=True)
+        shutil.copy2(SALTBOOT_MODULE_SETUP, moddir / "module-setup.sh")
+
+    monkeypatch.setattr(initrd_rpm_update, "_extract_rpm", fake_extract)
+    with pytest.raises(InitrdUpdateError, match="does not contain hook script"):
+        initrd_rpm_update.extract_dracut_saltboot_rpm(
+            tmp_path / "x.rpm", tmp_path, tmp_path / "stage"
+        )
+
+
+def test_is_dracut_saltboot_rpm_detection(monkeypatch, tmp_path):
+    def run(listing, rpm2cpio_rc=0):
+        def popen(command, **kwargs):
+            proc = _fake_process(returncode=rpm2cpio_rc if command[0] == "rpm2cpio" else 0)
+            proc.communicate.return_value = (
+                listing.encode() if command[0] == "cpio" else b"",
+                b"",
+            )
+            return proc
+
+        monkeypatch.setattr(initrd_rpm_update.subprocess, "Popen", popen)
+        return initrd_rpm_update.is_dracut_saltboot_rpm(tmp_path / "a.rpm")
+
+    assert run("./usr/lib/dracut/modules.d/50saltboot/module-setup.sh\n")
+    assert not run("./usr/bin/foo\n./usr/lib/dracut/modules.d/90other/module-setup.sh\n")
+    with pytest.raises(InitrdUpdateError):
+        run("", rpm2cpio_rc=1)

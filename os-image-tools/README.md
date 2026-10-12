@@ -63,6 +63,21 @@ python3 os-image-tools/initrd-rpm-update.py \
   --exclude '*.pyc'
 ```
 
+### Updating `dracut-saltboot`
+
+A `dracut-saltboot` RPM installs its module under `/usr/lib/dracut/modules.d/50saltboot/`, but dracut places the hook scripts elsewhere inside the initrd. The tool therefore detects RPMs containing `usr/lib/dracut/modules.d/*saltboot/module-setup.sh` and, instead of extracting them as-is, builds their overlay content from `module-setup.sh`:
+
+- `inst_hook <hook> <prio> "$moddir/<file>"` lines: `<file>` is copied to `lib/dracut/hooks/<hook>/<prio>-<file>` (for example `saltboot.sh` becomes `lib/dracut/hooks/pre-mount/99-saltboot.sh`).
+- `echo "<args>" > "${initdir}/etc/cmdline.d/<name>"` lines: the file `etc/cmdline.d/<name>` is regenerated with `<args>`.
+
+Limitations:
+
+- Only the two constructs above are handled; the rest of `install()` (binaries, salt minion payload, kernel modules, wicked configs) is ignored. Changes there require a proper initrd rebuild.
+- Unsupported forms of `inst_hook` or `cmdline.d` lines (variables, subshells, other quoting) and a module without any `inst_hook` make the tool fail rather than guess.
+- Paths use `lib/` (not `usr/lib/`), matching SLES initrds where `lib` is a real directory.
+- Other files in the RPM (for example systemd units) are not added to the initrd.
+- Regular RPMs given in the same run are extracted first; `dracut-saltboot` content is applied afterwards.
+
 ### Organization and image selection
 
 - Selected by required positive integer `--imageid` using the direct `image/getDetails` API. Image list enumeration is avoided.

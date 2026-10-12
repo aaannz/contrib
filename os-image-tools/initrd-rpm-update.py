@@ -558,35 +558,141 @@ def verify_required_tools() -> None:
         )
 
 
+def _rpm2cpio_pipe(
+    rpm: Path, cpio_args: Sequence[str], cwd: Path | None = None
+) -> bytes:
+    """Run `rpm2cpio RPM | cpio CPIO_ARGS` and return cpio's stdout."""
+    rpm2cpio_proc = subprocess.Popen(
+        ["rpm2cpio", str(rpm)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    cpio_proc = subprocess.Popen(
+        ["cpio", *cpio_args],
+        stdin=rpm2cpio_proc.stdout,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    if rpm2cpio_proc.stdout is not None:
+        rpm2cpio_proc.stdout.close()
+
+    cpio_stdout, cpio_stderr = cpio_proc.communicate()
+    _, rpm2cpio_stderr = rpm2cpio_proc.communicate()
+
+    if rpm2cpio_proc.returncode != 0:
+        raise InitrdUpdateError(
+            f"rpm2cpio failed for {rpm}: {_stderr_text(rpm2cpio_stderr)}"
+        )
+    if cpio_proc.returncode != 0:
+        raise InitrdUpdateError(
+            f"cpio failed for {rpm}: {_stderr_text(cpio_stderr)}"
+        )
+    return cpio_stdout
+
+
+def _extract_rpm(rpm: Path, dest_dir: Path) -> None:
+    _rpm2cpio_pipe(rpm, ["-idm", "--unconditional", "--quiet"], cwd=dest_dir)
+
+
 def extract_rpms(rpms: Sequence[Path], overlay_dir: Path) -> None:
     for rpm in rpms:
-        rpm2cpio_proc = subprocess.Popen(
-            ["rpm2cpio", str(rpm)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        _extract_rpm(rpm, overlay_dir)
+
+
+DRACUT_SALTBOOT_SETUP_RE = re.compile(
+    r"^(?:\./)?usr/lib/dracut/modules\.d/[^/]*saltboot/module-setup\.sh$"
+)
+INST_HOOK_RE = re.compile(
+    r"""^inst_hook\s+(\S+)\s+(\d+)\s+["']?\$\{?moddir\}?/([^"'\s/]+)["']?$"""
+)
+CMDLINE_ECHO_RE = re.compile(
+    r"""^echo\s+(?:"([^"$`]*)"|'([^']*)')\s*>\s*["']?\$\{?initdir\}?/(etc/cmdline\.d/[^"'\s/]+)["']?$"""
+)
+
+
+def is_dracut_saltboot_rpm(rpm: Path) -> bool:
+    """True if the RPM payload ships the dracut saltboot module."""
+    listing = _rpm2cpio_pipe(rpm, ["-t", "--quiet"])
+    return any(
+        DRACUT_SALTBOOT_SETUP_RE.match(line.strip())
+        for line in listing.decode("utf-8", errors="replace").splitlines()
+    )
+
+
+def parse_saltboot_module_setup(
+    module_setup: Path,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Parse the parts of module-setup.sh that are reproducible without dracut.
+
+    Returns (hooks, cmdline_files): hooks are (source file name relative to the
+    module directory, initrd path) and cmdline_files are (initrd path, content).
+    Everything else in install() is ignored.
+    """
+    hooks: list[tuple[str, str]] = []
+    cmdline_files: list[tuple[str, str]] = []
+
+    for raw_line in module_setup.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("#"):
+            continue
+
+        if line.startswith("inst_hook"):
+            match = INST_HOOK_RE.match(line)
+            if match is None:
+                raise InitrdUpdateError(
+                    f"Unsupported inst_hook line in {module_setup.name}: {line!r}"
+                )
+            hook, priority, name = match.groups()
+            hooks.append((name, f"lib/dracut/hooks/{hook}/{priority}-{name}"))
+        elif "/etc/cmdline.d/" in line:
+            match = CMDLINE_ECHO_RE.match(line)
+            if match is None:
+                raise InitrdUpdateError(
+                    f"Unsupported cmdline.d line in {module_setup.name}: {line!r}"
+                )
+            content = match.group(1) if match.group(1) is not None else match.group(2)
+            cmdline_files.append((match.group(3), content + "\n"))
+
+    if not hooks:
+        raise InitrdUpdateError(
+            f"No inst_hook lines found in {module_setup.name}; refusing to guess initrd layout"
         )
-        cpio_proc = subprocess.Popen(
-            ["cpio", "-idm", "--unconditional", "--quiet"],
-            stdin=rpm2cpio_proc.stdout,
-            cwd=overlay_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+    return hooks, cmdline_files
+
+
+def extract_dracut_saltboot_rpm(rpm: Path, overlay_dir: Path, staging_dir: Path) -> None:
+    """Place the saltboot module files where dracut installs them in the initrd."""
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    _extract_rpm(rpm, staging_dir)
+
+    setups = [
+        path
+        for path in (staging_dir / "usr/lib/dracut/modules.d").glob("*saltboot/module-setup.sh")
+    ]
+    if len(setups) != 1:
+        raise InitrdUpdateError(
+            f"Expected exactly one saltboot module-setup.sh in {rpm}, found {len(setups)}"
         )
+    module_setup = setups[0]
+    moddir = module_setup.parent
 
-        if rpm2cpio_proc.stdout is not None:
-            rpm2cpio_proc.stdout.close()
+    hooks, cmdline_files = parse_saltboot_module_setup(module_setup)
 
-        _, cpio_stderr = cpio_proc.communicate()
-        _, rpm2cpio_stderr = rpm2cpio_proc.communicate()
+    for name, dest_rel in hooks:
+        source = moddir / name
+        if not source.is_file():
+            raise InitrdUpdateError(f"{rpm} does not contain hook script {name}")
+        destination = overlay_dir / dest_rel
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
 
-        if rpm2cpio_proc.returncode != 0:
-            raise InitrdUpdateError(
-                f"rpm2cpio failed for {rpm}: {_stderr_text(rpm2cpio_stderr)}"
-            )
-        if cpio_proc.returncode != 0:
-            raise InitrdUpdateError(
-                f"cpio extraction failed for {rpm}: {_stderr_text(cpio_stderr)}"
-            )
+    for dest_rel, content in cmdline_files:
+        destination = overlay_dir / dest_rel
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+        destination.chmod(0o644)
 
 
 def _is_glob_pattern(value: str) -> bool:
@@ -1163,7 +1269,16 @@ def run_update(client: ApiClient, args: argparse.Namespace) -> str:
         overlay_member = temp_dir / "overlay-newc.zst"
         new_initrd = temp_dir / "updated-initrd"
 
-        extract_rpms(rpm_sources, overlay_dir)
+        regular_rpms: list[Path] = []
+        saltboot_rpms: list[Path] = []
+        for rpm in rpm_sources:
+            (saltboot_rpms if is_dracut_saltboot_rpm(rpm) else regular_rpms).append(rpm)
+
+        extract_rpms(regular_rpms, overlay_dir)
+        for index, rpm in enumerate(saltboot_rpms):
+            extract_dracut_saltboot_rpm(
+                rpm, overlay_dir, temp_dir / f"saltboot-stage-{index}"
+            )
         build_overlay_member(
             overlay_dir,
             overlay_member,
