@@ -550,11 +550,19 @@ def resolve_rpm_sources(paths: Sequence[str | Path]) -> list[Path]:
 
 def verify_required_tools() -> None:
     missing = [
-        tool for tool in ("rpm2cpio", "cpio", "zstd") if shutil.which(tool) is None
+        tool for tool in ("rpm2cpio", "cpio") if shutil.which(tool) is None
     ]
     if missing:
         raise InitrdUpdateError(
             "Missing required external command(s): " + ", ".join(missing)
+        )
+
+
+def verify_compressor_tool(compression: str) -> None:
+    if compression != "none" and shutil.which(compression) is None:
+        raise InitrdUpdateError(
+            f"Missing required external command: {compression} "
+            f"(needed to build a {compression} overlay matching the source initrd)"
         )
 
 
@@ -789,10 +797,79 @@ def _overlay_entries_filtered(
     return entries
 
 
+COMPRESSIONS = ("zstd", "xz", "gzip", "none")
+COMPRESSION_MAGIC = (
+    (b"\xfd7zXZ\x00", "xz"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
+    (b"\x1f\x8b", "gzip"),
+)
+NEWC_MAGIC = b"070701"
+NEWC_HEADER_SIZE = 110
+
+
+def _align4(value: int) -> int:
+    return (value + 3) & ~3
+
+
+def detect_initrd_compression(initrd: Path) -> str:
+    """Return the compression of the last segment of the initrd.
+
+    Skips leading uncompressed newc archives (for example early microcode).
+    Returns one of COMPRESSIONS; unknown formats raise InitrdUpdateError.
+    """
+    with initrd.open("rb") as source:
+        pos = 0
+        while True:
+            source.seek(pos)
+            head = source.read(NEWC_HEADER_SIZE)
+            if head[:6] != NEWC_MAGIC:
+                break
+
+            # Walk an uncompressed newc archive up to its trailer.
+            while head[:6] == NEWC_MAGIC:
+                filesize = int(head[54:62], 16)
+                namesize = int(head[94:102], 16)
+                name = source.read(namesize).rstrip(b"\0")
+                if name == b"TRAILER!!!":
+                    pos = pos + NEWC_HEADER_SIZE + namesize
+                    break
+                pos = _align4(_align4(pos + NEWC_HEADER_SIZE + namesize) + filesize)
+                source.seek(pos)
+                head = source.read(NEWC_HEADER_SIZE)
+            else:
+                raise InitrdUpdateError(
+                    f"Malformed cpio archive at offset {pos} in {initrd}"
+                )
+
+            # Skip zero padding after the trailer.
+            source.seek(pos)
+            while True:
+                chunk = source.read(4096)
+                if not chunk:
+                    return "none"
+                stripped = chunk.lstrip(b"\0")
+                if stripped:
+                    pos += len(chunk) - len(stripped)
+                    break
+                pos += len(chunk)
+
+        source.seek(pos)
+        magic = source.read(6)
+
+    for prefix, name in COMPRESSION_MAGIC:
+        if magic.startswith(prefix):
+            return name
+    raise InitrdUpdateError(
+        f"Unable to detect initrd compression of {initrd}; "
+        f"use --compression {{{','.join(COMPRESSIONS)}}}"
+    )
+
+
 def build_overlay_member(
     overlay_dir: Path,
     output_path: Path,
     exclude_patterns: Sequence[str] | None = None,
+    compression: str = "zstd",
 ) -> None:
     if exclude_patterns:
         entries = _overlay_entries_filtered(overlay_dir, exclude_patterns)
@@ -816,52 +893,85 @@ def build_overlay_member(
                 f"cpio archive build failed: {_stderr_text(cpio_result.stderr)}"
             )
 
-        zstd_result = subprocess.run(
-            ["zstd", "-q", "-z", "-o", str(output_path), str(temp_cpio)],
-            capture_output=True,
-            check=False,
-        )
-        if zstd_result.returncode != 0:
-            raise InitrdUpdateError(
-                f"zstd compression failed: {_stderr_text(zstd_result.stderr)}"
+        if compression == "none":
+            shutil.copyfile(temp_cpio, output_path)
+        elif compression == "zstd":
+            _run_compressor(
+                ["zstd", "-q", "-z", "-o", str(output_path), str(temp_cpio)],
+                compression,
             )
+        elif compression in ("xz", "gzip"):
+            # crc32 is the only xz check every kernel initramfs decoder accepts
+            command = (
+                ["xz", "--check=crc32", "-c", str(temp_cpio)]
+                if compression == "xz"
+                else ["gzip", "-9", "-n", "-c", str(temp_cpio)]
+            )
+            with output_path.open("wb") as compressed:
+                _run_compressor(command, compression, stdout=compressed)
+        else:
+            raise InitrdUpdateError(f"Unsupported compression: {compression}")
     finally:
         if temp_cpio.exists():
             temp_cpio.unlink()
 
 
-def validate_overlay_member(output_path: Path) -> None:
-    zstd_test = subprocess.run(
-        ["zstd", "--test", str(output_path)],
-        capture_output=True,
+def _run_compressor(command: list[str], name: str, stdout: Any = None) -> None:
+    result = subprocess.run(
+        command,
+        stdout=stdout,
+        stderr=subprocess.PIPE,
         check=False,
     )
-    if zstd_test.returncode != 0:
+    if result.returncode != 0:
         raise InitrdUpdateError(
-            f"zstd --test failed for overlay member: {_stderr_text(zstd_test.stderr)}"
+            f"{name} compression failed: {_stderr_text(result.stderr)}"
         )
 
-    zstd_proc = subprocess.Popen(
-        ["zstd", "-d", "-c", str(output_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+
+def validate_overlay_member(output_path: Path, compression: str = "zstd") -> None:
+    if compression == "none":
+        decompress_proc = None
+        cpio_stdin: Any = output_path.open("rb")
+    else:
+        test_flag = "-t" if compression == "gzip" else "--test"
+        test_result = subprocess.run(
+            [compression, test_flag, str(output_path)],
+            capture_output=True,
+            check=False,
+        )
+        if test_result.returncode != 0:
+            raise InitrdUpdateError(
+                f"{compression} {test_flag} failed for overlay member: "
+                f"{_stderr_text(test_result.stderr)}"
+            )
+
+        decompress_proc = subprocess.Popen(
+            [compression, "-d", "-c", str(output_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        cpio_stdin = decompress_proc.stdout
+
     cpio_proc = subprocess.Popen(
         ["cpio", "-t", "--quiet"],
-        stdin=zstd_proc.stdout,
+        stdin=cpio_stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
 
-    if zstd_proc.stdout is not None:
-        zstd_proc.stdout.close()
+    if cpio_stdin is not None:
+        cpio_stdin.close()
 
     _, cpio_stderr = cpio_proc.communicate()
-    _, zstd_stderr = zstd_proc.communicate()
+    decompress_stderr = b""
+    if decompress_proc is not None:
+        _, decompress_stderr = decompress_proc.communicate()
 
-    if zstd_proc.returncode != 0:
+    if decompress_proc is not None and decompress_proc.returncode != 0:
         raise InitrdUpdateError(
-            f"zstd decompression failed for overlay member: {_stderr_text(zstd_stderr)}"
+            f"{compression} decompression failed for overlay member: "
+            f"{_stderr_text(decompress_stderr)}"
         )
     if cpio_proc.returncode != 0:
         raise InitrdUpdateError(
@@ -1115,6 +1225,91 @@ def install_and_register(
     return installed_path
 
 
+def build_initrd_with_rpms(
+    source_initrd: Path,
+    rpm_sources: Sequence[Path],
+    output_path: Path,
+    work_dir: Path,
+    exclude_patterns: Sequence[str] | None = None,
+    compression: str = "auto",
+) -> None:
+    """Build output_path: source_initrd with an overlay of rpm_sources appended.
+
+    The overlay uses the source initrd's compression unless one is given, so the
+    result can be decoded as a single stream by standard tools.
+    """
+    if compression == "auto":
+        compression = detect_initrd_compression(source_initrd)
+    verify_compressor_tool(compression)
+
+    overlay_dir = work_dir / "overlay"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    overlay_member = work_dir / "overlay-newc.zst"
+
+    regular_rpms: list[Path] = []
+    saltboot_rpms: list[Path] = []
+    for rpm in rpm_sources:
+        (saltboot_rpms if is_dracut_saltboot_rpm(rpm) else regular_rpms).append(rpm)
+
+    extract_rpms(regular_rpms, overlay_dir)
+    for index, rpm in enumerate(saltboot_rpms):
+        extract_dracut_saltboot_rpm(
+            rpm, overlay_dir, work_dir / f"saltboot-stage-{index}"
+        )
+    build_overlay_member(overlay_dir, overlay_member, exclude_patterns, compression)
+    validate_overlay_member(overlay_member, compression)
+    build_updated_initrd(source_initrd, overlay_member, output_path)
+
+
+def run_local_update(args: argparse.Namespace) -> str:
+    """Update an initrd file without any server API calls or registration."""
+    rpm_sources = resolve_rpm_sources(args.rpm)
+    verify_required_tools()
+
+    source_initrd = Path(args.initrd).expanduser()
+    if not source_initrd.is_file():
+        raise InitrdUpdateError(f"Source initrd not found: {source_initrd}")
+
+    with tempfile.TemporaryDirectory(prefix="initrd-rpm-update-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        new_initrd = temp_dir / "updated-initrd"
+        build_initrd_with_rpms(
+            source_initrd,
+            rpm_sources,
+            new_initrd,
+            temp_dir,
+            args.exclude,
+            getattr(args, "compression", "auto"),
+        )
+        digest, size = compute_md5_and_size(new_initrd)
+
+        target_dir = source_initrd.parent
+        for _ in range(2048):
+            output_name = next_output_name(
+                source_initrd.name, [], target_dir
+            )
+            destination = target_dir / output_name
+            try:
+                with destination.open("xb") as out, new_initrd.open("rb") as src:
+                    shutil.copyfileobj(src, out)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise InitrdUpdateError(
+                    f"Failed to write {destination}: {exc}"
+                ) from exc
+            break
+        else:
+            raise InitrdUpdateError(
+                "Unable to write updated initrd because rpmupdate-N names keep colliding"
+            )
+
+    return (
+        f"Completed: new initrd written to {destination} with md5={digest} "
+        f"and size={size}; nothing was registered (--no-register)"
+    )
+
+
 def run_update(client: ApiClient, args: argparse.Namespace) -> str:
     rpm_sources = resolve_rpm_sources(args.rpm)
     verify_required_tools()
@@ -1263,29 +1458,15 @@ def run_update(client: ApiClient, args: argparse.Namespace) -> str:
                 )
             local_source_initrd = downloaded_source
 
-        overlay_dir = temp_dir / "overlay"
-        overlay_dir.mkdir(parents=True, exist_ok=True)
-
-        overlay_member = temp_dir / "overlay-newc.zst"
         new_initrd = temp_dir / "updated-initrd"
-
-        regular_rpms: list[Path] = []
-        saltboot_rpms: list[Path] = []
-        for rpm in rpm_sources:
-            (saltboot_rpms if is_dracut_saltboot_rpm(rpm) else regular_rpms).append(rpm)
-
-        extract_rpms(regular_rpms, overlay_dir)
-        for index, rpm in enumerate(saltboot_rpms):
-            extract_dracut_saltboot_rpm(
-                rpm, overlay_dir, temp_dir / f"saltboot-stage-{index}"
-            )
-        build_overlay_member(
-            overlay_dir,
-            overlay_member,
+        build_initrd_with_rpms(
+            local_source_initrd,
+            rpm_sources,
+            new_initrd,
+            temp_dir,
             getattr(args, "exclude", []),
+            getattr(args, "compression", "auto"),
         )
-        validate_overlay_member(overlay_member)
-        build_updated_initrd(local_source_initrd, overlay_member, new_initrd)
         digest, size = compute_md5_and_size(new_initrd)
 
         installed_path = install_and_register(
@@ -1328,7 +1509,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Emergency Saltboot initrd updater. Creates a new initrd by appending a "
-            "zstd-compressed newc CPIO overlay built from local RPMs."
+            "newc CPIO overlay, compressed like the source initrd, built from local RPMs."
         ),
         epilog="Run this tool on a Uyuni/SUSE Manager server.",
     )
@@ -1354,8 +1535,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--imageid",
         type=positive_int,
-        required=True,
-        help="Numeric ID of the image to select and update",
+        help="Numeric ID of the image to select and update (required unless --no-register)",
     )
     parser.add_argument(
         "--initrd",
@@ -1376,6 +1556,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Exclude files/directories from overlay by name or glob. Repeatable. "
             "Examples: __pycache__, *.pyc, usr/lib/python*/site-packages/*"
+        ),
+    )
+    parser.add_argument(
+        "--compression",
+        choices=("auto", *COMPRESSIONS),
+        default="auto",
+        help=(
+            "Compression of the appended overlay (default: auto = same as the "
+            "source initrd, so the result stays a single-format stream)"
+        ),
+    )
+    parser.add_argument(
+        "--no-register",
+        action="store_true",
+        help=(
+            "Only write the updated initrd next to the source initrd (requires --initrd). "
+            "No server connection, API call, registration or pillar update is made"
         ),
     )
     parser.add_argument(
@@ -1406,7 +1603,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.no_register:
+        if not args.initrd:
+            parser.error("--no-register requires --initrd")
+        if args.skip_pillar:
+            parser.error("--skip-pillar has no effect with --no-register")
+    elif args.imageid is None:
+        parser.error("--imageid is required unless --no-register is used")
+    return args
 
 
 def _resolve_password(args: argparse.Namespace) -> str:
@@ -1422,6 +1627,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     temp_ca_file: Path | None = None
     try:
         args = parse_args(argv)
+        if args.no_register:
+            print(run_local_update(args))
+            return 0
         password = _resolve_password(args)
 
         # Detect host mode early

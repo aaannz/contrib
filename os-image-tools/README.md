@@ -22,7 +22,7 @@ This tool creates a new initrd file from:
 1. A source initrd. If `--initrd` is omitted, the script automatically discovers the sole registered non-external initrd candidate for the image from its registered files list (metadata-only discovery). If multiple candidates are registered (e.g. after a repeated update), omitting `--initrd` fails with an ambiguity error, and explicit path selection is required.
 2. One or more local RPM sources provided via repeatable `--rpm PATH`.
 
-It does **not** modify the source initrd in place, and it does **not** replace or unregister the original initrd. It appends a Zstandard-compressed `newc` CPIO overlay to a copied initrd and registers the result as an additional initrd file.
+It does **not** modify the source initrd in place, and it does **not** replace or unregister the original initrd. It appends a `newc` CPIO overlay, compressed like the source initrd (see below), to a copied initrd and registers the result as an additional initrd file.
 
 ### Scope and warnings
 
@@ -35,7 +35,7 @@ It does **not** modify the source initrd in place, and it does **not** replace o
 
 - Python 3.11+
 - Python package: `requests`
-- Build host commands in `PATH`: `rpm2cpio`, `cpio`, `zstd` (extraction and compression always happen locally on the script's execution machine)
+- Build host commands in `PATH`: `rpm2cpio`, `cpio`, plus the compressor matching the source initrd: `xz`, `zstd` or `gzip` (extraction and compression always happen locally on the script's execution machine)
 
 ### Local RPM behavior and ordering
 
@@ -63,6 +63,13 @@ python3 os-image-tools/initrd-rpm-update.py \
   --exclude '*.pyc'
 ```
 
+### Overlay compression
+
+The overlay is compressed with the same format as the source initrd (detected from magic bytes, skipping leading uncompressed early-microcode cpio archives), so the final file is a single-format stream that standard tools (`xz -dc`, `zstd -dc`, `3cpio`, `lsinitrd`) can read end to end. Mixing formats (for example an xz initrd with a zstd overlay) is not used because such tools fail on it and the boot kernel would additionally need the zstd initramfs decoder.
+
+- Supported: `xz` (built with `--check=crc32`, which kernel decoders accept), `zstd`, `gzip`, and uncompressed.
+- Use `--compression {auto,xz,zstd,gzip,none}` to override; the default `auto` detects. Unknown source formats (for example lz4 or bzip2) fail unless `--compression` is given explicitly.
+
 ### Updating `dracut-saltboot`
 
 A `dracut-saltboot` RPM installs its module under `/usr/lib/dracut/modules.d/50saltboot/`, but dracut places the hook scripts elsewhere inside the initrd. The tool therefore detects RPMs containing `usr/lib/dracut/modules.d/*saltboot/module-setup.sh` and, instead of extracting them as-is, builds their overlay content from `module-setup.sh`:
@@ -77,6 +84,19 @@ Limitations:
 - Paths use `lib/` (not `usr/lib/`), matching SLES initrds where `lib` is a real directory.
 - Other files in the RPM (for example systemd units) are not added to the initrd.
 - Regular RPMs given in the same run are extracted first; `dracut-saltboot` content is applied afterwards.
+
+### Offline mode (`--no-register`)
+
+`--no-register` only builds the updated initrd and talks to no server: no login, no API calls, no `mgrctl`, no registration, no pillar update. It requires `--initrd` (a local file) and does not need `--imageid`; `--skip-pillar` is rejected as meaningless.
+
+The result is written next to the source initrd as `<original>-rpmupdate-N<suffix>` (next free `N` in that directory), and its md5 and size are printed. The operator is responsible for placing and registering the file and updating the pillar manually. The source directory must be writable.
+
+```bash
+python3 os-image-tools/initrd-rpm-update.py \
+  --no-register \
+  --initrd /root/my-image.initrd \
+  --rpm /root/rpms/
+```
 
 ### Organization and image selection
 

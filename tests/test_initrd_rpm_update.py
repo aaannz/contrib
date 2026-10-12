@@ -1131,6 +1131,8 @@ def test_run_update_skip_pillar_bypasses_pillar_calls(monkeypatch, tmp_path):
     monkeypatch.setattr(initrd_rpm_update, "get_image_context", lambda *_args: context)
     monkeypatch.setattr(initrd_rpm_update, "extract_rpms", lambda *_args: None)
     monkeypatch.setattr(initrd_rpm_update, "is_dracut_saltboot_rpm", lambda _rpm: False)
+    monkeypatch.setattr(initrd_rpm_update, "detect_initrd_compression", lambda _p: "zstd")
+    monkeypatch.setattr(initrd_rpm_update, "verify_compressor_tool", lambda _c: None)
     monkeypatch.setattr(initrd_rpm_update, "build_overlay_member", lambda *_args: None)
     monkeypatch.setattr(
         initrd_rpm_update, "validate_overlay_member", lambda *_args: None
@@ -1351,3 +1353,205 @@ def test_is_dracut_saltboot_rpm_detection(monkeypatch, tmp_path):
     assert not run("./usr/bin/foo\n./usr/lib/dracut/modules.d/90other/module-setup.sh\n")
     with pytest.raises(InitrdUpdateError):
         run("", rpm2cpio_rc=1)
+
+
+# ==========================================
+# --no-register
+# ==========================================
+def test_parse_args_no_register_rules():
+    args = parse_args(["--no-register", "--initrd", "/tmp/i.initrd", "--rpm", "/tmp/a.rpm"])
+    assert args.no_register and args.imageid is None
+
+    with pytest.raises(SystemExit):
+        parse_args(["--no-register", "--rpm", "/tmp/a.rpm"])
+    with pytest.raises(SystemExit):
+        parse_args(
+            ["--no-register", "--skip-pillar", "--initrd", "/tmp/i", "--rpm", "/tmp/a.rpm"]
+        )
+
+
+def test_run_local_update_writes_next_to_source(monkeypatch, tmp_path):
+    source = tmp_path / "img.initrd"
+    source.write_bytes(b"base")
+    (tmp_path / "img-rpmupdate-1.initrd").write_bytes(b"old")
+
+    def fake_build(src, rpms, output, work_dir, excludes, compression):
+        output.write_bytes(src.read_bytes() + b"+overlay")
+
+    monkeypatch.setattr(initrd_rpm_update, "resolve_rpm_sources", lambda _r: [Path("a.rpm")])
+    monkeypatch.setattr(initrd_rpm_update, "verify_required_tools", lambda: None)
+    monkeypatch.setattr(initrd_rpm_update, "build_initrd_with_rpms", fake_build)
+
+    args = Namespace(rpm=["a.rpm"], initrd=str(source), exclude=[])
+    message = initrd_rpm_update.run_local_update(args)
+
+    result = tmp_path / "img-rpmupdate-2.initrd"
+    assert result.read_bytes() == b"base+overlay"
+    assert source.read_bytes() == b"base"
+    assert str(result) in message
+
+
+def test_main_no_register_makes_no_api_calls(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(initrd_rpm_update, "run_local_update", lambda _a: "done")
+    monkeypatch.setattr(
+        initrd_rpm_update,
+        "ApiClient",
+        lambda *_a, **_k: pytest.fail("ApiClient must not be created"),
+    )
+    monkeypatch.setattr(
+        initrd_rpm_update,
+        "_resolve_password",
+        lambda _a: pytest.fail("password must not be requested"),
+    )
+    rc = initrd_rpm_update.main(
+        ["--no-register", "--initrd", str(tmp_path / "i"), "--rpm", "a.rpm"]
+    )
+    assert rc == 0
+    assert "done" in capsys.readouterr().out
+
+
+# ==========================================
+# overlay compression matching
+# ==========================================
+def _newc(files: dict[str, bytes], tmp_path: Path) -> bytes:
+    src = tmp_path / "newc-src"
+    src.mkdir(exist_ok=True)
+    for name, data in files.items():
+        (src / name).write_bytes(data)
+    return subprocess.run(
+        ["cpio", "-o", "-H", "newc", "--quiet"],
+        cwd=src,
+        input="\n".join(files).encode(),
+        capture_output=True,
+        check=True,
+    ).stdout
+
+
+def _compress(fmt: str, data: bytes) -> bytes:
+    cmd = {
+        "xz": ["xz", "--check=crc32", "-c"],
+        "zstd": ["zstd", "-q", "-c"],
+        "gzip": ["gzip", "-n", "-c"],
+        "none": None,
+    }[fmt]
+    if cmd is None:
+        return data
+    return subprocess.run(cmd, input=data, capture_output=True, check=True).stdout
+
+
+needs_tools = pytest.mark.skipif(
+    not all(shutil.which(t) for t in ("cpio", "xz", "zstd", "gzip")),
+    reason="cpio, xz, zstd and gzip are required",
+)
+
+
+@needs_tools
+@pytest.mark.parametrize("fmt", ["xz", "zstd", "gzip", "none"])
+def test_detect_initrd_compression(tmp_path, fmt):
+    initrd = tmp_path / "i"
+    initrd.write_bytes(_compress(fmt, _newc({"a": b"1"}, tmp_path)))
+    assert initrd_rpm_update.detect_initrd_compression(initrd) == fmt
+
+
+@needs_tools
+@pytest.mark.parametrize("fmt", ["xz", "zstd", "gzip"])
+def test_detect_initrd_compression_skips_early_cpio(tmp_path, fmt):
+    early = _newc({"kernel": b"ucode"}, tmp_path)
+    main = _compress(fmt, _newc({"a": b"1"}, tmp_path))
+    initrd = tmp_path / "i"
+    initrd.write_bytes(early + main)
+    assert initrd_rpm_update.detect_initrd_compression(initrd) == fmt
+
+
+def test_detect_initrd_compression_unknown(tmp_path):
+    initrd = tmp_path / "i"
+    initrd.write_bytes(b"BZh91AY&SY" + b"\0" * 32)
+    with pytest.raises(InitrdUpdateError, match="--compression"):
+        initrd_rpm_update.detect_initrd_compression(initrd)
+
+
+@needs_tools
+@pytest.mark.parametrize("fmt", ["xz", "zstd", "gzip", "none"])
+def test_overlay_matches_source_and_decodes_as_single_stream(tmp_path, fmt):
+    base = _compress(fmt, _newc({"base-file": b"base"}, tmp_path))
+    source = tmp_path / "src.initrd"
+    source.write_bytes(base)
+
+    overlay = tmp_path / "overlay"
+    (overlay / "lib").mkdir(parents=True)
+    (overlay / "lib" / "new-file").write_bytes(b"new")
+    member = tmp_path / "member"
+    build_overlay_member(overlay, member, None, fmt)
+    validate_overlay_member(member, fmt)
+    out = tmp_path / "out.initrd"
+    build_updated_initrd(source, member, out)
+
+    decoder = {
+        "xz": ["xz", "-dc"],
+        "zstd": ["zstd", "-dc"],
+        "gzip": ["gzip", "-dc"],
+        "none": ["cat"],
+    }[fmt]
+    def decode(path: Path) -> bytes:
+        with path.open("rb") as handle:
+            return subprocess.run(
+                decoder, stdin=handle, capture_output=True, check=True
+            ).stdout
+
+    # A single decoder run (exit 0) must cover base and overlay; cpio itself
+    # stops at the first trailer, so check the stream and then the overlay part.
+    assert decode(out) == decode(source) + decode(member)
+    listing = subprocess.run(
+        ["cpio", "-t", "--quiet"], input=decode(member), capture_output=True, check=True
+    ).stdout.decode()
+    assert "lib/new-file" in listing
+
+
+def test_build_overlay_member_xz_and_gzip_commands(monkeypatch, tmp_path):
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        if command[0] == "cpio":
+            kwargs["stdout"].write(b"cpio")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(initrd_rpm_update.subprocess, "run", fake_run)
+    out = tmp_path / "m"
+    build_overlay_member(overlay, out, None, "xz")
+    build_overlay_member(overlay, out, None, "gzip")
+    cpio_path = str(out) + ".cpio"
+    assert commands[1] == ["xz", "--check=crc32", "-c", cpio_path]
+    assert commands[3] == ["gzip", "-9", "-n", "-c", cpio_path]
+
+
+def test_parse_args_compression_choices():
+    assert parse_args(["--imageid", "1", "--rpm", "a"]).compression == "auto"
+    assert parse_args(["--imageid", "1", "--rpm", "a", "--compression", "xz"]).compression == "xz"
+    with pytest.raises(SystemExit):
+        parse_args(["--imageid", "1", "--rpm", "a", "--compression", "lz4"])
+
+
+def test_build_initrd_with_rpms_auto_detects_and_explicit_overrides(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(initrd_rpm_update, "detect_initrd_compression", lambda _p: "xz")
+    monkeypatch.setattr(initrd_rpm_update, "verify_compressor_tool", lambda _c: None)
+    monkeypatch.setattr(initrd_rpm_update, "is_dracut_saltboot_rpm", lambda _r: False)
+    monkeypatch.setattr(initrd_rpm_update, "extract_rpms", lambda *_a: None)
+    monkeypatch.setattr(
+        initrd_rpm_update, "build_overlay_member", lambda *a: seen.append(("build", a[3]))
+    )
+    monkeypatch.setattr(
+        initrd_rpm_update, "validate_overlay_member", lambda *a: seen.append(("validate", a[1]))
+    )
+    monkeypatch.setattr(initrd_rpm_update, "build_updated_initrd", lambda *_a: None)
+
+    initrd_rpm_update.build_initrd_with_rpms(
+        tmp_path / "s", [], tmp_path / "o", tmp_path, [], "auto"
+    )
+    initrd_rpm_update.build_initrd_with_rpms(
+        tmp_path / "s", [], tmp_path / "o", tmp_path, [], "gzip"
+    )
+    assert seen == [("build", "xz"), ("validate", "xz"), ("build", "gzip"), ("validate", "gzip")]
